@@ -1,40 +1,49 @@
 # About
 MWC Apple Apple Silicon is designed and optimized for Apple Silicon CPU, but in theory should work on amy device that support Metal.
 
-
-
 # Build setup (Mac OS)
+
+Install cmake if you don't have it:
+```
+> brew install cmake
+```
+
+
 Install jsoncpp:
 ```
-brew install jsoncpp
+> brew install jsoncpp
 ```
 
-# Compile test and version
 
-## Tests 
-
-Tests are expected to be run in the Debug mode. Only developers are expected to run them if code was updated.
-First build the tests and run them.
-```
-cmake -DBUILD_TARGET=TESTS -DCMAKE_BUILD_TYPE=Debug .
-make
-./mwc_cpu_miner
-```
-Running tests will take about 15 minutes. Internal states are validated with 'assert' calls. 
-
-## Build miner
+# Clone and build the miner
 
 ```
-cmake -DBUILD_TARGET=CPU_MINER -DCMAKE_BUILD_TYPE=Release .
-make
-./mwc_cpu_miner
+> cd <your_dev_root_directory>
+> git clone git@github.com:mwcproject/mwc-metal-miner.git
+> cd mwc-metal-miner
+> cmake -DBUILD_TARGET=CPU_MINER -DCMAKE_BUILD_TYPE=Release .
+> make
+```
+
+mwc_metal_miner executable should be located in your current directory. Run it to see the usage.
+
+```
+> ./mwc_metal_miner
+Usage: ./mwc_metal_miner -node <host:port> -login <user_name> [-pass <password>]
 ```
 
 # Run miner
 
+If you are mining solo, please check documentaiton how to setup the node and the wallet: https://github.com/mwcproject/mwc-node/tree/master/doc/mining
+
+If you are using mining pool, you need to know host:port for stratum connection and your user name.
+
 cpu-mwc-miner usage:
 ```
-./mwc_cpu_miner -node <host:port> -login <user_name> [-pass <password>] -algo <C31|C32>
+Usage: ./mwc_metal_miner -node <host:port> -login <user_name> [-pass <password>]
 ```
 
-'-node' should point to the mwc-node that runs with enable stratum. 
+-node:  host:port of mining node stratum interface. If you run your mining node locally with activated stratum protocol, use parameter `-node 127.0.0.1:3416` for mainnet and `-node 127.0.0.1:13416` for floonet.
+-login: your user name for stratum or mining pool. If you are mining solo, you can use any name.
+-pass: optional password for your login. Might be required by some mining pools.
+
