@@ -25,11 +25,11 @@ Install jsoncpp:
 > make
 ```
 
-mwc_metal_miner executable should be located in your current directory. Run it to see the usage.
+mwc-metal-miner executable should be located in your current directory. Run it to see the usage.
 
 ```
-> ./mwc_metal_miner
-Usage: ./mwc_metal_miner -node <host:port> -login <user_name> [-pass <password>]
+> ./mwc-metal-miner
+Usage: ./mwc-metal-miner -node <host:port> -login <user_name> [-pass <password>]
 ```
 
 # Run miner
@@ -40,7 +40,7 @@ If you are using mining pool, you need to know host:port for stratum connection 
 
 cpu-mwc-miner usage:
 ```
-Usage: ./mwc_metal_miner -node <host:port> -login <user_name> [-pass <password>]
+Usage: ./mwc-metal-miner -node <host:port> -login <user_name> [-pass <password>]
 ```
 
 -node:  host:port of mining node stratum interface. If you run your mining node locally with activated stratum protocol, use parameter `-node 127.0.0.1:3416` for mainnet and `-node 127.0.0.1:13416` for floonet.

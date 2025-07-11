@@ -13,7 +13,7 @@
 # limitations under the License.
 
 cmake_minimum_required(VERSION 3.30)
-project(mwc_metal_miner)
+project(mwc-metal-miner)
 
 find_package(jsoncpp REQUIRED)
 
@@ -118,10 +118,10 @@ else()
     message(FATAL_ERROR "Invalid BUILD_TARGET value. Expected CPU_MINER,PERF_TEST.")
 endif()
 
-add_executable(mwc_metal_miner ${SOURCES})
+add_executable(mwc-metal-miner ${SOURCES})
 
 # Link Metal Frameworks and Metal-Cpp
-target_link_libraries(mwc_metal_miner PRIVATE
+target_link_libraries(mwc-metal-miner PRIVATE
         jsoncpp_lib
         "-framework Metal"
         "-framework Foundation"

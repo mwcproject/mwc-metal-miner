@@ -39,6 +39,8 @@
 #include "miner_network.h"
 #include "utils.h"
 
+#define VERSION "1.0.0"
+
 // Miner
 
 std::atomic<bool> exiting(false);
@@ -54,6 +56,7 @@ void signal_handler(int signal) {
 int main(int argc, char* argv[]) {
     // Parse command-line arguments
     if (argc < 5) {
+        std::cerr << "mwc-metal-miner Version: " << VERSION << std::endl;
         std::cerr << "Usage: " << argv[0] << " -node <host:port> -login <user_name> [-pass <password>]" << std::endl;
         return 1;
     }
@@ -91,6 +94,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::cout << "mwc-metal-miner Version: " << VERSION << std::endl;
     std::cout << "Connecting to node: " << nodeHost << ":" << nodePort << std::endl;
     std::cout << "Login: " << loginName << std::endl;
     std::cout << "Algorithm: C31" << std::endl;
