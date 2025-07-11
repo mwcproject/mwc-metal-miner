@@ -16,10 +16,11 @@ Install jsoncpp:
 
 
 # Clone and build the miner
-
+Note, mwc-metal-miner requires metal-cpp in the same dev root directory. That is why please clone both those projects
 ```
 > cd <your_dev_root_directory>
-> git clone git@github.com:mwcproject/mwc-metal-miner.git
+> git clone https://github.com/bkaradzic/metal-cpp.git
+> git clone https://github.com/mwcproject/mwc-metal-miner.git
 > cd mwc-metal-miner
 > cmake -DBUILD_TARGET=CPU_MINER -DCMAKE_BUILD_TYPE=Release .
 > make
