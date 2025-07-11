@@ -18,6 +18,7 @@
 
 #include <cstdint>
 
+// nonce to hash calculaiton on CPU
 uint32_t sip_hash(const uint64_t * v, uint64_t nce);
 
 #endif //SIP_HASH_H

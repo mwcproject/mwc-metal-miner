@@ -1,5 +1,7 @@
 # About
-MWC CPU miner is designed and optimized for Apple Silicon CPU. See details below about performance and memory consumtpion.
+MWC Apple Apple Silicon is designed and optimized for Apple Silicon CPU, but in theory should work on amy device that support Metal.
+
+
 
 # Build setup (Mac OS)
 Install jsoncpp:

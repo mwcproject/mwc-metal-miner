@@ -31,11 +31,15 @@
 #include <thread>
 #include <unistd.h>
 #include <csignal>
+#include <pthread.h>
 
-#include "miner_network.h"
 #include "blake.h"
 #include "cuckatoo.h"
+#include "cuckatoo_pipeline.h"
+#include "miner_network.h"
 #include "utils.h"
+
+// Miner
 
 std::atomic<bool> exiting(false);
 
@@ -43,14 +47,14 @@ std::atomic<bool> exiting(false);
 void signal_handler(int signal) {
     if (signal == SIGINT) {
         std::cout << "Exiting the miner, please wait..." << std::endl;
-        exiting = true;
+        exiting.store(true, std::memory_order_relaxed);
     }
 }
 
 int main(int argc, char* argv[]) {
     // Parse command-line arguments
-    if (argc < 7) {
-        std::cerr << "Usage: " << argv[0] << " -node <host:port> -login <user_name> [-pass <password>] -algo <C31|C32>" << std::endl;
+    if (argc < 5) {
+        std::cerr << "Usage: " << argv[0] << " -node <host:port> -login <user_name> [-pass <password>]" << std::endl;
         return 1;
     }
 
@@ -58,7 +62,6 @@ int main(int argc, char* argv[]) {
     int nodePort = -1;
     std::string loginName;
     std::string password;
-    std::string algo;
 
     for (int i = 2; i < argc; i += 2) {
         std::string key = argv[i-1];
@@ -76,8 +79,6 @@ int main(int argc, char* argv[]) {
             loginName = value;
         } else if (key == "-pass") {
             password = value;
-        } else if (key == "-algo") {
-            algo = value;
         }
         else {
             std::cerr << "Unknown arguments: " << key << std::endl;
@@ -90,41 +91,23 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Validate algorithm
-    if (algo != "C31" && algo != "C32") {
-        std::cerr << "Invalid algorithm. Must be C31 or C32." << std::endl;
-        return 1;
-    }
-
     std::cout << "Connecting to node: " << nodeHost << ":" << nodePort << std::endl;
     std::cout << "Login: " << loginName << std::endl;
-    std::cout << "Algorithm: " << algo << std::endl;
+    std::cout << "Algorithm: C31" << std::endl;
 
     std::signal(SIGINT, signal_handler);
 
-    Solver * solver = nullptr;
-    int edge_bits = -1;
-    if (algo=="C31") {
-        // uint8_t EDGE_BITS, uint8_t BUCKET_BITS, uint ELEMENT_SIZE, uint GRAPH_SIZE
-        solver = new CuckatooSolver<31, 9, 5, 42>();
-        edge_bits = 31;
-    }
-    else {
-        // c32
-        solver = new CuckatooSolver<32, 9, 5, 42>();
-        edge_bits = 32;
-    }
-    assert(solver);
+    const int edge_bits = 31;
 
-
-    MinerNetwork network;
+    MinerNetwork network(edge_bits);
 
     std::random_device rd;
     std::mt19937_64 nonce_gen(rd()); // Fixed seed
     std::uniform_int_distribution<uint64_t> uint64_dist(0, UINT64_MAX);
 
+    int iteration = 0;
 
-    while(!exiting) {
+    while(!exiting.load(std::memory_order_relaxed)) {
         std::cout << "Connecting to the node..." << std::endl;
         if (!network.connect(nodeHost, nodePort)) {
             std::cout << "Unable connect to the node. Waiting some time to reconnect." << std::endl;
@@ -141,9 +124,11 @@ int main(int argc, char* argv[]) {
         std::chrono::time_point last_get_job_request_time = std::chrono::steady_clock::now();
         std::chrono::time_point last_keep_alive_request_time = last_get_job_request_time;
 
-        while (network.is_running() && !exiting) {
+        CuckatooPipeline cuckatoo_pipeline(&network);
+
+        while (network.is_running() && !exiting.load(std::memory_order_relaxed)) {
             auto now = std::chrono::steady_clock::now();
-            if (now - last_keep_alive_request_time > std::chrono::seconds(20)) {
+            if (now - last_keep_alive_request_time > std::chrono::seconds(60)) {
                 network.sendKeepAliveRequest();
                 last_keep_alive_request_time = now;
             }
@@ -171,33 +156,29 @@ int main(int argc, char* argv[]) {
             std::time_t now_time_t = std::chrono::system_clock::to_time_t(sys_now);
             std::tm now_tm = *std::localtime(&now_time_t);
 
-            std::cout << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") <<  " Starting job: " << currentTask.jobId << " for height: " << currentTask.height <<
-                ", difficulty: " << currentTask.difficulty << ", nonce: " << nonce << std::endl;
+            std::cout << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") <<  " Starting " << (++iteration) << " C31 job: " << currentTask.jobId << " for height: " << currentTask.height <<
+                ", difficulty: " << currentTask.difficulty << ", nonce: " << std::hex << nonce << std::dec << std::endl;
 
             uint64_t v[4];
             currentTask.calculate_seed_hash(nonce, v);
 
+            // Known solution
+            //uint64_t v[4] = {0xcdc22e3228ae6ce4,0x9b702732c5917f3a,0x987dab75b205767,0x358d6c79d4355934};
+
             // Starting cucckatoo calculations...
-            solver->set_hash(v);
-            std::vector<CycleSolution> res_graphs;
-            solver->build_graph(res_graphs, false);
-            if (!res_graphs.empty()) {
-                std::vector<uint64_t> res_nonces;
-                std::vector<uint8_t> hash = solver->resolve_found_to_nonces(res_graphs, res_nonces);
-                std::cout << "Found solutions: " << res_graphs.size() << "  Hash: " << bin2hexstr(hash) << std::endl;
-                network.sendResponseRequest(edge_bits, currentTask, nonce, res_nonces);
-            }
+
+            cuckatoo_pipeline.submit_task( currentTask.height, currentTask.jobId, nonce, v );
+
+            //std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
+        cuckatoo_pipeline.release();
         network.stop_running();
 
         // Wait for threads to finish
         readerThread.join();
         writerThread.join();
     }
-
-    delete solver;
-    solver = nullptr;
 
     return 0;
 }

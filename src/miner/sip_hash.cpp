@@ -36,4 +36,3 @@ uint32_t sip_hash(const uint64_t * v, uint64_t nonce) {
     SIPROUND; SIPROUND; SIPROUND; SIPROUND;
     return uint32_t(v0 ^ v1 ^ v2  ^ v3);
 }
-

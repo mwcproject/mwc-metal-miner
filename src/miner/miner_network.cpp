@@ -5,8 +5,9 @@
 #include "miner_network.h"
 #include "blake.h"
 #include "utils.h"
+#include "features.h"
 
-const std::string AGENT = "mwc-scpu-miner";
+const std::string AGENT = "mwc-metal-miner";
 
 void CuckaJob::calculate_seed_hash( uint64_t nonce, uint64_t res_v[4]) {
     for (int i = 0; i < 8; i++) {
@@ -21,7 +22,7 @@ void CuckaJob::calculate_seed_hash( uint64_t nonce, uint64_t res_v[4]) {
 ////////////////////////////////////////////////////////////////////////////////////////////
 // MinerNetwork
 
-MinerNetwork::MinerNetwork() {
+MinerNetwork::MinerNetwork(int _edge_bits) : edge_bits(_edge_bits) {
 }
 
 MinerNetwork::~MinerNetwork() {
@@ -110,28 +111,30 @@ static Json::Value generateGetJobRequest(int request_id) {
 }
 
 // Get keepalive request
-static Json::Value generateKeepAliveRequest() {
+static Json::Value generateKeepAliveRequest(int request_id) {
     Json::Value request;
+    request["id"] = request_id;
     request["jsonrpc"] = "2.0";
     request["method"] = "keepalive";
-    request["method"] =  Json::nullValue;
+    request["params"] =  Json::nullValue;
     return request;
 }
 
-static Json::Value generateSubmitRequest(int request_id, int edge_bits, const CuckaJob & job,
-    uint64_t nonce, const std::vector<uint64_t> & res_nonces ) {
+static Json::Value generateSubmitRequest(int request_id, int edge_bits, int height, int jobId,
+        uint64_t nonce, const std::vector<uint32_t> & res_nonces )
+{
     Json::Value request;
     request["id"] = request_id;
     request["jsonrpc"] = "2.0";
     request["method"] = "submit";
     Json::Value & params = request["params"];
     params["edge_bits"] = edge_bits;
-    params["height"] = job.height;
-    params["job_id"] = job.jobId;
+    params["height"] = height;
+    params["job_id"] = jobId;
     params["nonce"] = nonce;
     Json::Value pow(Json::arrayValue); // Create a JSON array
     for (uint64_t nonce : res_nonces) {
-        pow.append(nonce);
+        pow.append(uint64_t(nonce));
     }
     params["pow"] = pow;
     return request;
@@ -170,7 +173,7 @@ std::string MinerNetwork::readJsonMessage() {
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 std::cerr << "Failed to read from socket: " << strerror(errno) << std::endl;
             }
-            int err = errno;
+            //int err = errno;
             running = false;
             requestsCV.notify_one(); // triggering exit for Writer thread
             return "";
@@ -190,7 +193,7 @@ Json::Value parseJson(const std::string& jsonString) {
 
     std::istringstream s(jsonString);
     if (!Json::parseFromStream(reader, s, &root, &errs)) {
-        std::cerr << "Failed to parse JSON: " << errs << std::endl;
+        std::cerr << "Failed to parse JSON: " << jsonString << "  Error:" << errs << std::endl;
     }
 
     return root;
@@ -198,7 +201,8 @@ Json::Value parseJson(const std::string& jsonString) {
 
 // Network reader thread
 void MinerNetwork::networkReaderThread() {
-    while (running) {
+    pthread_setname_np("networkReaderThread");
+    while (running.load(std::memory_order_relaxed)) {
         std::string message = readJsonMessage();
         if (!message.empty()) {
             Json::Value jsonMessage = parseJson(message);
@@ -240,7 +244,9 @@ void MinerNetwork::networkReaderThread() {
                 }
                 else {
                     if (jsonMessage.isMember("result")) {
+#ifdef SHOW_NETWORK
                         std::cout << "Response for " << method << ": " << json2str(jsonMessage["result"]) << std::endl;
+#endif
                     }
                     if (jsonMessage.isMember("error")) {
                         auto err_val = jsonMessage["error"];
@@ -259,18 +265,21 @@ void MinerNetwork::networkReaderThread() {
             }
         }
     }
+#ifdef SHOW_NETWORK
     std::cout << "Network Reader is exited..." << std::endl;
+#endif
 }
 
 // Network writer thread
 void MinerNetwork::networkWriterThread() {
-    while (running) {
+    pthread_setname_np("networkWriterThread");
+    while (running.load(std::memory_order_relaxed)) {
         std::unique_lock<std::mutex> lock(requestsMutex);
         requestsCV.wait(lock, [&] {
-            return !requestsPool.empty() || !running;
+            return !requestsPool.empty() || !running.load(std::memory_order_relaxed);
         });
 
-        if (!running)
+        if (!running.load(std::memory_order_relaxed))
             break;
 
         while (!requestsPool.empty()) {
@@ -289,26 +298,38 @@ void MinerNetwork::sendLoginMessage(const std::string & loginName, const std::st
     std::lock_guard<std::mutex> lock(requestsMutex);
     requestsPool.push(generateLoginRequest(request_id++, loginName, password));
     if (sendGetJobRequest) {
-        requestsPool.push(generateGetJobRequest(request_id++));
+        requestsPool.push(generateGetJobRequest(request_id.fetch_add(1)));
     }
     requestsCV.notify_one();
 }
 
 void MinerNetwork::sendKeepAliveRequest() {
     std::lock_guard<std::mutex> lock(requestsMutex);
-    requestsPool.push(generateKeepAliveRequest());
+    requestsPool.push(generateKeepAliveRequest(request_id.fetch_add(1)));
     requestsCV.notify_one();
 }
 
 void MinerNetwork::sendGetJobRequest() {
     std::lock_guard<std::mutex> lock(requestsMutex);
-    requestsPool.push(generateGetJobRequest(request_id++));
+    requestsPool.push(generateGetJobRequest(request_id.fetch_add(1)));
     requestsCV.notify_one();
 }
 
-void MinerNetwork::sendResponseRequest(int edge_bits, const CuckaJob & job, uint64_t nonce, const std::vector<uint64_t> & res_nonces) {
-    Json::Value submit_request = generateSubmitRequest(request_id++, edge_bits, job, nonce, res_nonces);
+void MinerNetwork::submit_response(int height, int jobId, uint64_t nonce, const std::vector<uint32_t> & res_nonces) {
+    {
+        std::lock_guard<std::mutex> lock(jobMutex);
+        if (activeJob.height > height) {
+            std::cout << "Skipping outdated solution..." << std::endl;
+            return;
+        }
+    }
+
+    std::cout << "Submitting found solution..." << std::endl;
+
+    Json::Value submit_request = generateSubmitRequest(request_id.fetch_add(1), edge_bits, height, jobId, nonce, res_nonces);
+#ifdef SHOW_NETWORK
     std::cout << "Submitted response: " << json2str(submit_request) << std::endl;
+#endif
     std::lock_guard<std::mutex> lock(requestsMutex);
     requestsPool.push(submit_request);
     requestsCV.notify_one();

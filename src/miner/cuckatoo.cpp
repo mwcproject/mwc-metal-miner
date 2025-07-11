@@ -13,20 +13,3 @@
 // limitations under the License.
 
 #include "cuckatoo.h"
-
-static bool is_prime(uint32_t num) {
-    if (num < 2) return false;
-    if (num % 2 == 0) return num == 2;
-    for (uint32_t i = 3; i * i <= num; i += 2) {
-        if (num % i == 0) return false;
-    }
-    return true;
-}
-
-// Function to get the next prime >= start
-uint32_t next_prime(uint32_t start) {
-    while (!is_prime(start)) {
-        start++;
-    }
-    return start;
-}
