@@ -14,11 +14,11 @@ void test_st1_build_buckets(const uint64_t * v,
                         MetalContext & context,
                         uint32_t bucket_allocated_size,
                         const std::vector<MemRange> & st1_8B_buckets,
-                        const std::vector<MemRange> & st1_1B_buckets,
+                        const std::vector<MemRange> & st1_4B_buckets,
                         uint EDGE_BITS)
 {
     const uint hash_mask = (uint(1) << EDGE_BITS) - 1;
-    const uint BUCKETS_NUM = st1_8B_buckets.size() + st1_1B_buckets.size();
+    const uint BUCKETS_NUM = st1_8B_buckets.size() + st1_4B_buckets.size();
     const uint bucket_size = (uint(1) << EDGE_BITS) / BUCKETS_NUM;
 
     uint32_t found_nonces = 0;
@@ -53,11 +53,11 @@ void test_st1_build_buckets(const uint64_t * v,
         }
     }
 
-    // Checking 1b data
-    for (int b1i = 0; b1i < st1_1B_buckets.size(); b1i++) {
+    // Checking 4b data
+    for (int b1i = 0; b1i < st1_4B_buckets.size(); b1i++) {
         uint bucket_idx = b1i + st1_8B_buckets.size();
 
-        uint32_t * data = (uint32_t *) st1_1B_buckets[b1i].get_data_ptr(context);
+        uint32_t * data = (uint32_t *) st1_4B_buckets[b1i].get_data_ptr(context);
         for (int u=0; u < bucket_allocated_size; u++) {
             uint64_t itm = data[u];
             if (itm==0xFFFFFFFF) {

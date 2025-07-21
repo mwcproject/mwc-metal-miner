@@ -80,12 +80,8 @@ int main(int argc, char* argv[]) {
         uint64_t v[4];
         task.calculate_seed_hash(nonce, v);
 */
-        REPORT_RESET;
-
         // Starting cucckatoo calculations...
         solver.test_build_all(hash_with_solution);
-
-        REPORT_GENERATE;
     }
 
     return 0;

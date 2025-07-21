@@ -21,6 +21,11 @@
 #include "metal_structs.h"
 #include "small_hash_table.h"
 
+#ifdef SYNC_METAL_MANUALLY
+#define RES_UNTRACKED  MTL::ResourceHazardTrackingModeUntracked
+#else
+#define RES_UNTRACKED 0
+#endif
 
 #ifdef NDEBUG
 #define RES_TYPE  MTL::ResourceStorageModePrivate
@@ -43,6 +48,86 @@ struct MetalCalcPair {
     ~MetalCalcPair();
     void init(MTL::Device* device, MTL::Library* library, const char * function_name);
 };
+
+struct MetalEncoderManager {
+private:
+    MTL::CommandQueue* queue;
+    MTL::CommandBuffer *command = nullptr;
+    MTL::ComputeCommandEncoder *encoder = nullptr;
+
+    std::vector< MTL::CommandBuffer *> stash;
+public:
+    MetalEncoderManager(MTL::CommandQueue* _queue) : queue(_queue) {}
+    ~MetalEncoderManager() {
+        assert(encoder==nullptr);
+        assert(command==nullptr);
+
+        for (auto b : stash) {
+            b->waitUntilCompleted();
+            b->release();
+        }
+    }
+
+    MTL::ComputeCommandEncoder * get_encoder() {
+        if (command==nullptr) {
+            command = queue->commandBuffer();
+        }
+        if (encoder==nullptr) {
+            encoder = command->computeCommandEncoder(MTL::DispatchType::DispatchTypeSerial);
+        }
+        else {
+//            encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+  //          encoder->memoryBarrier(MTL::BarrierScopeTextures);
+        }
+        return encoder;
+    }
+
+    MTL::CommandBuffer * get_command_buffer() {
+#ifdef METAL_DO_WAITS
+        assert(command==nullptr);
+#else
+        assert(command);
+#endif
+        return command;
+    }
+
+    MTL::CommandBuffer * take_command_buffer() {
+        if (encoder!=nullptr) {
+            encoder->endEncoding();
+            encoder->retain();
+            encoder->release();
+            encoder = nullptr;
+        }
+        MTL::CommandBuffer * ret = command;
+        if (command!=nullptr) {
+            command->commit();
+            command->retain();
+            command = nullptr;
+        }
+        return ret;
+    }
+
+    void stash_buf(MTL::CommandBuffer *cmd_buf) { stash.push_back(cmd_buf); }
+
+    void wait_stash() {
+        for (auto b : stash) {
+            b->waitUntilCompleted();
+            b->release();
+        }
+        stash.clear();
+    }
+
+    void waitUntilCompleted() {
+        MTL::CommandBuffer * bf = take_command_buffer();
+        if (bf) {
+            bf->waitUntilCompleted();
+            assert(bf->status() == MTL::CommandBufferStatusCompleted);
+            bf->release();
+        }
+    }
+
+};
+
 
 /**
  * Phase1 resulting data
@@ -185,26 +270,22 @@ private:
     // Primary Execution steps
 
     // Step1, the first command. Initial distribution by Buckets
-    void call_st1_build_buckets(MetalContext & context, std::vector<MTL::CommandBuffer*> & running_commands,
-#ifdef STAGE1_TESTS
-                    const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_1B_buckets,
+    void call_st1_build_buckets(MetalEncoderManager & encMrg, MetalContext & context,
+#if defined(STAGE1_TESTS) || defined(WRITE_DUMP)
+                    const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_4B_buckets,
 #endif
-                    int emit_event,
                     const uint64_t hash_keys[4]);
 
     // Trimming and secondary distribution by buckets.
-    void call_st2_trim_bucketing(MetalContext &context,
-                                           int wait_event, int emit_event,
+    void call_st2_trim_bucketing(MetalEncoderManager & encMrg, MetalContext &context,
                                            const uint64_t hash_keys[4],
-                                           std::vector<MTL::CommandBuffer *> &running_commands,
                                            std::vector<std::vector<MemRange>> & buckets,
                                            int bucket_idx,
-                                           const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_1B_buckets,
+                                           const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_4B_buckets,
                                            std::string & prev_event);
 
     // Process trimming step, no moving between buckets, data will be reused
-    MTL::CommandBuffer* execute_trimming_steps(MetalContext &context,
-                                           MTL::CommandBuffer* command,
+    void execute_trimming_steps(MetalEncoderManager & encMrg, MetalContext &context,
                                            bool run_tests,
                                            const std::vector<std::vector<MemRange>> & buckets,
                                            bool passU,
@@ -213,41 +294,41 @@ private:
                                            std::string & prev_event);
 
     // Copy phase1 resulting data into the buffer.
-    void copy_resulting_data(MetalContext &context, std::vector<MTL::CommandBuffer *> &running_commands,
+    void copy_resulting_data(MetalEncoderManager & encMrg, MetalContext &context,
                 MTL::Buffer* resulting_buffer,
                 const std::vector<std::vector<MemRange>> & buckets,
                 std::string & prev_event);
 private:
     // Tier-2 execution steps related to a single kernel command
-    MTL::CommandBuffer * call_nonce_to_8b(MTL::CommandBuffer *command, MetalContext &context,
+    void call_nonce_to_8b(MetalEncoderManager & encMrg, MetalContext &context,
                     const MemRange &in_range, const MemRange & b8_range,
                     std::string & prev_event,
                      const uint64_t hash_keys[4] );
 
-    MTL::CommandBuffer * call_build_mask_simple(MTL::CommandBuffer *command, MetalContext &context,
+    void call_build_mask_simple(MetalEncoderManager & encMrg, MetalContext &context,
                 uint bucket_idx,
                 std::string & prev_event);
 
-    MTL::CommandBuffer * call_trimmed_to_next_buckets_st2(MTL::CommandBuffer *command, MetalContext &context,
+    void call_trimmed_to_next_buckets_st2(MetalEncoderManager & encMrg, MetalContext &context,
                 uint bucket_idx,
                 std::string & prev_event);
 
-    MTL::CommandBuffer * call_compact_zeroes(MTL::CommandBuffer *command, MetalContext &context,
+    void call_compact_zeroes(MetalEncoderManager & encMrg, MetalContext &context,
                 uint bucket_idx,
                 std::string & prev_event,
                 uint32_t trim_param_offset);
 
-    MTL::CommandBuffer * call_apply_collapsed_data(MTL::CommandBuffer *command, MetalContext &context,
+    void call_apply_collapsed_data(MetalEncoderManager & encMrg, MetalContext &context,
                  bool isStep2,
                  int mask_scale_k,
                  bool passU, uint bucket_idx,
                 std::string & prev_event);
 
-    MTL::CommandBuffer * call_build_mask(MTL::CommandBuffer *command, MetalContext &context,
+    void call_build_mask(MetalEncoderManager & encMrg, MetalContext &context,
                     bool passU, uint32_t bucket_idx,
                     std::string & prev_event);
 
-    MTL::CommandBuffer * call_trimmed_to_next_buckets_st_trim(MTL::CommandBuffer *command, MetalContext &context,
+    void call_trimmed_to_next_buckets_st_trim(MetalEncoderManager & encMrg, MetalContext &context,
                     bool passU, uint32_t bucket_idx,
                     std::string & prev_event);
 
@@ -294,13 +375,13 @@ private:
             const std::vector<uint32_t> & bucket_positions_pre_collapse);
 #endif
 private:
-    void init_st1_build_buckets_params(MetalContext &context,
+    void init_st1_build_buckets_params(MetalEncoderManager & encMrg, MetalContext &context,
                 const uint64_t hash_keys[4],
                 Step1Params* params,
                 std::vector<MemRange> & st1_8B_buckets,
                 std::vector<MemRange> & st1_1B_buckets);
 
-    std::vector<MemRange> init_build_mask_and_buckets_st2(MetalContext &context,
+    std::vector<MemRange> init_build_mask_and_buckets_st2(MetalEncoderManager & encMrg, MetalContext &context,
             const uint64_t hash_keys[4],
             Step2Params* kernel_data,
             uint32_t bucket_idx,

@@ -108,10 +108,6 @@ public:
     virtual MTL::Buffer* get_collapse_stash_buffer() override;
     virtual MTL::Buffer* take_collapse_stash_buffer() override;
     virtual uint32_t* get_collapse_stash() override;
-
-    virtual MTL::SharedEvent* get_event() override {assert(false); return nullptr;}
-    virtual int generate_next_event() override {assert(false); return 0;}
-
 };
 
 

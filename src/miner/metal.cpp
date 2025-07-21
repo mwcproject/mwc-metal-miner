@@ -32,6 +32,7 @@
 #include "../tests/test_st1_build_buckets.h"
 #include "../tests/test_nonce_to_8b.h"
 #include "../tests/test_build_mask.h"
+#include "../tests/data_dump.h"
 
 // 1.02 - have few at 64 buckets.  We can accept such loss
 #define BUFFERS_OVERHEAD 1.08
@@ -160,18 +161,17 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
     std::vector<MemRange> st1_8B_buckets;
     std::vector<MemRange> st1_1B_buckets;
 
-    init_st1_build_buckets_params(context, hash_keys, context.get_st1_nonce28_params(), st1_8B_buckets, st1_1B_buckets);
+    MetalEncoderManager enc_man(primary_queue);
+
+    init_st1_build_buckets_params(enc_man, context, hash_keys, context.get_st1_nonce28_params(), st1_8B_buckets, st1_1B_buckets);
 
     std::vector<MTL::CommandBuffer*> running_commands;
 
-    int st1_event = context.generate_next_event();
-
     // Step1 - initial buckets distribution
-    call_st1_build_buckets(context, running_commands,
-#ifdef STAGE1_TESTS
+    call_st1_build_buckets(enc_man, context,
+#if defined(STAGE1_TESTS) || defined(WRITE_DUMP)
                     st1_8B_buckets, st1_1B_buckets,
 #endif
-                    st1_event,
                     hash_keys);
 
 #ifndef NDEBUG
@@ -193,26 +193,27 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
     // Creating 1b/8b processing pipelines. Result must be 8b data for the V raw, in 64 buckets
     // 8b processing first because it will allow to release some memory thta will be used for 1b
 
-    int prev_event = st1_event;
-
     for (int bidx = 0; bidx < BUCKETS_NUM; bidx++) {
 #ifndef NDEBUG
 #ifdef SHOW_TRACING
             std::cout << "First pass at " << bidx << ", memory usage: " << context.get_mem_pool()->getMemoryStatus() << std::endl;
 #endif
 #endif
-            int next_event = context.generate_next_event();
-            call_st2_trim_bucketing(context,
-                                    prev_event, next_event,
+            call_st2_trim_bucketing( enc_man, context,
                                     hash_keys,
-                                    running_commands,
                                     buckets, bidx,
                                     st1_8B_buckets, st1_1B_buckets,
                                     perf_prev_event);
-            prev_event = next_event;
     }
 
+/*    MTL::CommandBuffer * buf = enc_man.take_command_buffer();
+    if (buf)
+        buf->waitUntilCompleted();
+    enc_man.wait_stash();
+
     REPORT_EVENT("stage2 ends", "stage2 start", "main", "");
+
+return FindCycleStartResult();*/
 
 //    int mask_scale_k = 1;
     int mask_mul_idx = 0;
@@ -262,10 +263,6 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
             for (uint k=0;k<BUCKETS_NUM;k++) {
                 buckets_sum += positions[ k*BUCKETS_NUM +k ];
             }
-
-            // Progress is not going down, we can exit
-            if (buckets_sum >= uint(last_buckets_sum * 0.99))
-                break;
 #ifdef SHOW_TRACING
             std::cout << "Current edges_number: " << (buckets_sum*BUCKETS_NUM) <<
                                 "  Progress: " << (double(last_buckets_sum-buckets_sum)/last_buckets_sum*100.0)  << std::endl;
@@ -280,10 +277,6 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
 
         /////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Start trimming process
-        MTL::CommandBuffer* command = primary_queue->commandBuffer();
-#ifndef METAL_DO_WAITS
-        command->encodeWait(context.get_event(), prev_event);
-#endif
         for (int bidx = 0; bidx < BUCKETS_NUM; bidx++) {
 #ifndef NDEBUG
 #ifdef SHOW_TRACING
@@ -291,7 +284,7 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
 #endif
 #endif
 
-            command = execute_trimming_steps(context, command,
+            execute_trimming_steps(enc_man, context,
 #ifdef STAGE_TRIM_TESTS
             true,
 #else
@@ -304,13 +297,6 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
                                            perf_prev_event);
         }
 
-#ifndef METAL_DO_WAITS
-        command->commit();
-        command->waitUntilCompleted();
-#endif
-        command->retain();
-        command->release();
-
         std::string end_name = "trim_end_" + std::to_string(trim_idx);
         REPORT_EVENT( end_name.c_str(), start_name.c_str() , "main", "");
         perf_prev_event = end_name;
@@ -321,23 +307,16 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
     // result is edges plus positions
     MTL::Buffer* resulting = device->newBuffer( PHASE1_EDGE_PER_BUCKET * BUCKETS_NUM*BUCKETS_NUM * 8 + BUCKETS_NUM*BUCKETS_NUM*4, MTL::ResourceStorageModeShared );
     {
-        copy_resulting_data(context, running_commands,
+        copy_resulting_data(enc_man, context,
                 resulting,
                 buckets,
                 perf_prev_event);
     }
 
-#ifndef METAL_DO_WAITS
-    // waiting for all commands to finish
-    for (MTL::CommandBuffer* cmd : running_commands) {
-        cmd->waitUntilCompleted();
-        assert(cmd->status() == MTL::CommandBufferStatusCompleted);
-        // released because earlier it is expected that retain was already called.
-        cmd->release();
-    }
-#else
-    assert(running_commands.empty());
-#endif
+    MTL::CommandBuffer * bf = enc_man.take_command_buffer();
+    if (bf)
+        bf->waitUntilCompleted();
+    enc_man.wait_stash();
 
     REPORT_EVENT("PrimaryFinished","Start", "main", "");
 
@@ -349,12 +328,13 @@ FindCycleStartResult MetalOps::find_cycles_start(MetalContext & context,
 void MetalOps::find_cycles_phase2(MetalContext & context, bool lastPassU) {
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
 
+    assert(secondary_queue); // call init_seed_hash first!
+    MetalEncoderManager encMgr(secondary_queue);
+
     REPORT_EVENT("StartPhase2","", "main", "");
     std::string perf_prev_event = "StartPhase2";
 
     // Allocate memory
-    assert(secondary_queue); // call init_seed_hash first!
-
     std::vector<std::vector<MemRange>> buckets;
     {
         buckets.resize(BUCKETS_NUM);
@@ -442,16 +422,13 @@ void MetalOps::find_cycles_phase2(MetalContext & context, bool lastPassU) {
 
         /////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Start trimming process
-        MTL::CommandBuffer* command = secondary_queue->commandBuffer();
-        MTL::CommandBuffer* cmd_copy = command;
-
         for (int bidx = 0; bidx < BUCKETS_NUM; bidx++) {
 #ifndef NDEBUG
 #ifdef SHOW_TRACING
             std::cout << "Trimming " << trim_idx << " at " << bidx << std::endl;
 #endif
 #endif
-            command = execute_trimming_steps(context, command,
+            execute_trimming_steps( encMgr, context,
 #ifdef PHASE2_TESTS
             true,
 #else
@@ -465,16 +442,12 @@ void MetalOps::find_cycles_phase2(MetalContext & context, bool lastPassU) {
         }
 
         // Waiting for all. Here we can afford it, no rush with loading the Q
-#ifndef METAL_DO_WAITS
-        assert(cmd_copy == command);
-        // waiting for all commands to finish
-        command->commit();
-        command->waitUntilCompleted();
-        assert(command->status() == MTL::CommandBufferStatusCompleted);
-#endif
-        command->retain();
-        command->release();
-        (void)cmd_copy;
+
+        MTL::CommandBuffer *  bf = encMgr.take_command_buffer();
+        if (bf) {
+            bf->waitUntilCompleted();
+            bf->release();
+        }
 
         std::string end_name = "trim_end_" + std::to_string(phase2_trim_idx);
         REPORT_EVENT( end_name.c_str(), start_name.c_str() , "main", "");
@@ -527,15 +500,13 @@ void MetalOps::discover_nonces(MetalContextDiscover & context ) {
 ///
 
 // Step1
-void MetalOps::call_st1_build_buckets(MetalContext & context, std::vector<MTL::CommandBuffer*> & running_commands,
-#ifdef STAGE1_TESTS
-                    const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_1B_buckets,
+void MetalOps::call_st1_build_buckets(MetalEncoderManager & encMrg, MetalContext & context,
+#if defined(STAGE1_TESTS) || defined(WRITE_DUMP)
+                    const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_4B_buckets,
 #endif
-                    int emit_event,
                     const uint64_t hash_keys[4])
 {
-        MTL::CommandBuffer* command = primary_queue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+        MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
         encoder->setComputePipelineState(f_st1_build_buckets.pipeline);
 
         int buf_idx = 0;
@@ -551,9 +522,6 @@ void MetalOps::call_st1_build_buckets(MetalContext & context, std::vector<MTL::C
 
         // Dispatch threads for each buffer (assuming 1 result per buffer)
         encoder->dispatchThreads(MTL::Size(STEP1_THREADS*BUCKETS_NUM, 1, 1), MTL::Size(STEP1_THREADS, 1, 1));
-        encoder->endEncoding();
-        encoder->retain();
-        encoder->release();
 
 #ifdef METALL_CALLBACKS_PERF
         command->addCompletedHandler([=](MTL::CommandBuffer* buffer) {
@@ -562,17 +530,25 @@ void MetalOps::call_st1_build_buckets(MetalContext & context, std::vector<MTL::C
             }
         });
 #endif
-        command->encodeSignalEvent(context.get_event(), emit_event);
+        //command->encodeSignalEvent(context.get_event(), emit_event);
 
-        // Submit task, no waiting
-        command->commit();
-        command->retain();
 #ifdef METAL_DO_WAITS
-        command->waitUntilCompleted();
-        assert(command->status() == MTL::CommandBufferStatusCompleted);
-        command->release();
-#else
-        running_commands.push_back(command);
+    encMrg.waitUntilCompleted();
+
+#ifdef WRITE_DUMP
+    assert(st1_8B_buckets.size() + st1_4B_buckets.size() == BUCKETS_NUM);
+    for (int u=0;u<st1_4B_buckets.size(); u++) {
+        std::vector<uint64_t> data;
+        st1_4B_buckets[u].copy_data_into(context, data);
+        write_dump( data, std::string("st1_4b_") + std::to_string(u) );
+    }
+    for (int u=0;u<st1_8B_buckets.size(); u++) {
+        std::vector<uint64_t> data;
+        st1_8B_buckets[u].copy_data_into(context, data);
+        write_dump( data, std::string("st1_8b_") + std::to_string(u) );
+    }
+#endif
+
 #endif
 
         // Validation...
@@ -612,42 +588,44 @@ void MetalOps::call_st1_build_buckets(MetalContext & context, std::vector<MTL::C
                         context,
                         context.get_st1_nonce28_params()->bucket_size,
                         st1_8B_buckets,
-                        st1_1B_buckets,
+                        st1_4B_buckets,
                         EDGE_BITS);
 #endif
 #endif
         }
 }
 
-void MetalOps::call_st2_trim_bucketing(MetalContext &context,
-                                       int wait_event, int emit_event,
+void MetalOps::call_st2_trim_bucketing(MetalEncoderManager & encMrg, MetalContext &context,
                                        const uint64_t hash_keys[4],
-                                       std::vector<MTL::CommandBuffer *> &running_commands,
                                        std::vector<std::vector<MemRange>> & buckets,
                                        int bucket_idx,
-                                       const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_1B_buckets,
+                                       const std::vector<MemRange> & st1_8B_buckets, const std::vector<MemRange> & st1_4B_buckets,
                                        std::string & prev_event) {
 
     MemRange b8_range;
 
-    MTL::CommandBuffer *command = primary_queue->commandBuffer();
-    MTL::CommandBuffer *cmd_copy = command;
-
     // nonce to 8b edges if needed
     if (bucket_idx >= BUCKETS_8B_NUM) {
         // we are at 1b buckets. Let's decode them into the bigger buffer
-        const MemRange &in_range = st1_1B_buckets[bucket_idx - BUCKETS_8B_NUM];
-        b8_range = context.get_mem_pool()->allocate(in_range.get_length_bytes() * 2);
+        const MemRange &in_range = st1_4B_buckets[bucket_idx - BUCKETS_8B_NUM];
+        b8_range = context.get_mem_pool()->allocate(in_range.get_length_bytes() * 2, encMrg);
 
-        command = call_nonce_to_8b(command, context,
+        call_nonce_to_8b(encMrg, context,
                     in_range, b8_range,
                     prev_event,
                     hash_keys);
 
+#ifdef WRITE_DUMP
+        // Waiting first
+        std::vector<uint64_t> data;
+        b8_range.copy_data_into(context, data);
+        write_dump( data, std::string("st1_8b_") + std::to_string(bucket_idx) );
+#endif
+
 #ifdef METAL_DO_WAITS
-        context.get_mem_pool()->release(st1_1B_buckets[bucket_idx - BUCKETS_8B_NUM], context, nullptr); // Original data can be released, it is a relatevely big chunk
+        context.get_mem_pool()->release(st1_4B_buckets[bucket_idx - BUCKETS_8B_NUM], context, nullptr); // Original data can be released, it is a relatevely big chunk
 #else
-        context.get_mem_pool()->release(st1_1B_buckets[bucket_idx - BUCKETS_8B_NUM], context, command); // Original data can be released, it is a relatevely big chunk
+        context.get_mem_pool()->release(st1_4B_buckets[bucket_idx - BUCKETS_8B_NUM], context, encMrg.get_command_buffer() ); // Original data can be released, it is a relatevely big chunk
 #endif
 
     }
@@ -658,7 +636,7 @@ void MetalOps::call_st2_trim_bucketing(MetalContext &context,
     std::vector<MemRange> res_buckets;
     // Let's use half of the buckets. I think we should be good enough at this point from collisions point of view.
     std::vector<MemRange> in =
-            init_build_mask_and_buckets_st2(context, hash_keys, context.get_st2_params(bucket_idx), bucket_idx, b8_range, res_buckets); // no scale now
+            init_build_mask_and_buckets_st2(encMrg, context, hash_keys, context.get_st2_params(bucket_idx), bucket_idx, b8_range, res_buckets); // no scale now
 
     assert(res_buckets.size() == BUCKETS_NUM);
     assert(buckets[bucket_idx].size() == 0);
@@ -672,12 +650,57 @@ void MetalOps::call_st2_trim_bucketing(MetalContext &context,
 #endif
 
 #ifndef METAL_DO_WAITS
-    command->encodeWait(context.get_event(), wait_event);
+//    command->encodeWait(context.get_event(), wait_event);
 #endif
 
-    command = call_build_mask_simple(command, context, bucket_idx, prev_event);
-    command = call_trimmed_to_next_buckets_st2(command, context, bucket_idx, prev_event);
-    command = call_compact_zeroes(command, context, bucket_idx, prev_event, context.get_st2_trimming_params_offset(bucket_idx));
+    call_build_mask_simple(encMrg, context, bucket_idx, prev_event);
+
+#ifdef WRITE_DUMP
+    {
+        std::vector<uint64_t> data;
+        assert(context.get_mask_size() % 8 == 0);
+        data.resize(context.get_mask_size()/8);
+        memcpy( data.data(), context.get_mask(), data.size()*8  );
+        write_dump( data, std::string("st2_mask_") + std::to_string(bucket_idx) );
+    }
+#endif
+
+      // Checking data matching for debugging...
+/*    {
+        encMrg.waitUntilCompleted();
+        std::vector<uint64_t> data;
+        assert(context.get_mask_size() % 8 == 0);
+        data.resize(context.get_mask_size()/8);
+        memcpy( data.data(), context.get_mask(), data.size()*8  );
+
+        std::vector<uint64_t> exp_data;
+        read_dump( std::string("st2_mask_") + std::to_string(bucket_idx), exp_data );
+
+        assert(exp_data.size() == data.size());
+        int sz = exp_data.size();
+        for (int r=0; r<sz; r++) {
+            assert( data[r] == exp_data[r] );
+        }
+    }*/
+
+    call_trimmed_to_next_buckets_st2(encMrg, context, bucket_idx, prev_event);
+    call_compact_zeroes(encMrg, context, bucket_idx, prev_event, context.get_st2_trimming_params_offset(bucket_idx));
+
+#ifdef WRITE_DUMP
+    {
+        assert(context.get_bucket_positions_size() % 8 == 0);
+        std::vector<uint64_t> data;
+        data.resize( context.get_bucket_positions_size()/8 );
+        memcpy(data.data(), context.get_bucket_positions(), data.size()*8);
+        write_dump( data, std::string("st2_bucket_positions1_") + std::to_string(bucket_idx) );
+
+        const std::vector<MemRange> & bkts = buckets[bucket_idx];
+        for ( int r=0;r<bkts.size(); r++ ) {
+            bkts[r].copy_data_into(context, data);
+            write_dump( data, std::string("st2_bkt_compact_") + std::to_string(bucket_idx) + "_" + std::to_string(r));
+        }
+    }
+#endif
 
 #ifndef NDEBUG
     std::unordered_map<uint64_t, CollapsedData> collapsed_data;
@@ -690,11 +713,29 @@ void MetalOps::call_st2_trim_bucketing(MetalContext &context,
             bucket_positions_pre_collapse);
 #endif
 
-    command = call_apply_collapsed_data(command, context,
+    call_apply_collapsed_data(encMrg, context,
                 true, 1, true,
                 bucket_idx, prev_event);
 
-    command->encodeSignalEvent(context.get_event(), emit_event);
+#ifdef METAL_DO_WAITS
+    encMrg.waitUntilCompleted();
+#endif
+
+#ifdef WRITE_DUMP
+    {
+        assert(context.get_bucket_positions_size() % 8 == 0);
+        std::vector<uint64_t> data;
+        data.resize( context.get_bucket_positions_size()/8 );
+        memcpy(data.data(), context.get_bucket_positions(), data.size()*8);
+        write_dump( data, std::string("st2_bucket_positions2_") + std::to_string(bucket_idx) );
+
+        const std::vector<MemRange> & bkts = buckets[bucket_idx];
+        for ( int r=0;r<bkts.size(); r++ ) {
+            bkts[r].copy_data_into(context, data);
+            write_dump( data, std::string("st2_bkt_collapsed_") + std::to_string(bucket_idx) + "_" + std::to_string(r));
+        }
+    }
+#endif
 
 #ifndef NDEBUG
     test_collapsed_data_results(context, bucket_idx,
@@ -703,28 +744,16 @@ void MetalOps::call_st2_trim_bucketing(MetalContext &context,
         buckets);
 #endif
 
-    command->retain();
-#ifdef METAL_DO_WAITS
-    command->release();
-    command = nullptr;
-#else
-    assert(cmd_copy == command);
-    command->commit();
-    running_commands.push_back(command);
-#endif
-    (void)cmd_copy;
-
     // Original data can be released, it is a relatevely big chunk
-    context.get_mem_pool()->release(b8_range, context, command);
+    context.get_mem_pool()->release(b8_range, context, encMrg.get_command_buffer());
 
 }
 
-void MetalOps::copy_resulting_data(MetalContext &context, std::vector<MTL::CommandBuffer *> &running_commands,
+void MetalOps::copy_resulting_data(MetalEncoderManager & encMrg,  MetalContext &context,
                 MTL::Buffer* resulting_buffer,
                 const std::vector<std::vector<MemRange>> & buckets,
                 std::string & prev_event) {
-    MTL::CommandBuffer *command = primary_queue->commandBuffer();
-    MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_copy_resulting_data.pipeline);
 
     int buf_idx = 0;
@@ -742,9 +771,6 @@ void MetalOps::copy_resulting_data(MetalContext &context, std::vector<MTL::Comma
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size(COPY_THREADS*BUCKETS_NUM*BUCKETS_NUM, 1, 1),
                         MTL::Size(COPY_THREADS, 1, 1));
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
     command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer* buffer) {
@@ -755,18 +781,9 @@ void MetalOps::copy_resulting_data(MetalContext &context, std::vector<MTL::Comma
     });
 #endif
 
-    // Submit task, no waiting
-    command->commit();
-    command->retain();
 #ifdef METAL_DO_WAITS
-    command->waitUntilCompleted();
-    assert(command->status() == MTL::CommandBufferStatusCompleted);
-    command->release();
-#else
-    running_commands.push_back(command);
-#endif
+    encMrg.waitUntilCompleted();
 
-#ifdef METAL_DO_WAITS
     // Validation...
     {
         // let's run some tests for the resulting data.
@@ -817,8 +834,7 @@ std::vector<MemRange> MetalOps::construct_in_data(const std::vector<std::vector<
     return in;
 }
 
-MTL::CommandBuffer* MetalOps::execute_trimming_steps(MetalContext &context,
-                                       MTL::CommandBuffer* command,
+void MetalOps::execute_trimming_steps(MetalEncoderManager & encMrg, MetalContext &context,
                                        bool run_tests,
                                        const std::vector<std::vector<MemRange>> & buckets,
                                        bool passU,
@@ -857,13 +873,13 @@ MTL::CommandBuffer* MetalOps::execute_trimming_steps(MetalContext &context,
     }
 #endif
 
-    command = call_build_mask(command, context,
+    call_build_mask(encMrg, context,
                         passU, bucket_idx,
                         prev_event);
-    command = call_trimmed_to_next_buckets_st_trim(command, context,
+    call_trimmed_to_next_buckets_st_trim(encMrg, context,
                         passU, bucket_idx,
                        prev_event);
-    command = call_compact_zeroes(command, context,
+    call_compact_zeroes(encMrg, context,
                             bucket_idx,
                             prev_event, context.get_trimming_params_offset(passU, bucket_idx));
 
@@ -902,7 +918,7 @@ MTL::CommandBuffer* MetalOps::execute_trimming_steps(MetalContext &context,
     }
 #endif
 
-    command = call_apply_collapsed_data(command, context,
+    call_apply_collapsed_data(encMrg, context,
                 false,
                 1,
                 passU,
@@ -922,17 +938,15 @@ MTL::CommandBuffer* MetalOps::execute_trimming_steps(MetalContext &context,
                 bucket_threads_positions_trim);
     }
 #endif
-
-    return command;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-MTL::CommandBuffer * MetalOps::call_nonce_to_8b(MTL::CommandBuffer *command, MetalContext &context,
+void MetalOps::call_nonce_to_8b( MetalEncoderManager & encMrg, MetalContext &context,
                     const MemRange &in_range, const MemRange & b8_range,
                     std::string & prev_event,
                      const uint64_t hash_keys[4] ) {
-        MTL::ComputeCommandEncoder *encoder = command->computeCommandEncoder();
+        MTL::ComputeCommandEncoder *encoder = encMrg.get_encoder();
         encoder->setComputePipelineState(f_nonce_to_8b.pipeline);
 
         int buf_idx = 0;
@@ -946,9 +960,6 @@ MTL::CommandBuffer * MetalOps::call_nonce_to_8b(MTL::CommandBuffer *command, Met
         // Dispatch threads for each buffer (assuming 1 result per buffer)
         encoder->dispatchThreads(MTL::Size(NONCE_TO_8B_THREADS * BUCKETS_NUM, 1, 1),
                                  MTL::Size(NONCE_TO_8B_THREADS, 1, 1));
-        encoder->endEncoding();
-        encoder->retain();
-        encoder->release();
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
         command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer *buffer) {
@@ -961,13 +972,7 @@ MTL::CommandBuffer * MetalOps::call_nonce_to_8b(MTL::CommandBuffer *command, Met
 #endif
 
 #ifdef METAL_DO_WAITS
-        command->commit();
-        command->waitUntilCompleted();
-        assert(command->status() == MTL::CommandBufferStatusCompleted);
-        command->retain();
-        command->release();
-
-        command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
 
         {
@@ -977,15 +982,13 @@ MTL::CommandBuffer * MetalOps::call_nonce_to_8b(MTL::CommandBuffer *command, Met
 #endif
 #endif
         }
-
-        return command;
 }
 
-MTL::CommandBuffer * MetalOps::call_build_mask_simple(MTL::CommandBuffer *command, MetalContext &context,
+void MetalOps::call_build_mask_simple(MetalEncoderManager & encMrg, MetalContext &context,
             uint bucket_idx,
             std::string & prev_event)
 {
-    MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_build_mask_simple.pipeline);
 
     int buf_idx = 0;
@@ -1000,12 +1003,9 @@ MTL::CommandBuffer * MetalOps::call_build_mask_simple(MTL::CommandBuffer *comman
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size(BUCKETS_NUM * BUILD_MASK_THREADS_NUM, 1, 1),
                                  MTL::Size(BUILD_MASK_THREADS_NUM, 1, 1));
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
 
     // trim_mask
-    encoder = command->computeCommandEncoder();
+    encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_trim_mask.pipeline);
 
     encoder->setBuffer(context.get_mask_buffer(), context.get_mask_offset(), 0);
@@ -1018,9 +1018,6 @@ MTL::CommandBuffer * MetalOps::call_build_mask_simple(MTL::CommandBuffer *comman
 
     // Dispatch threads for each buffer (assuming 1 result per buffer)
      encoder->dispatchThreads(MTL::Size(tasks, 1, 1), MTL::Size(1, 1, 1)); // 8192 tasks
-     encoder->endEncoding();
-     encoder->retain();
-     encoder->release();
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
         command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer *buffer) {
@@ -1033,23 +1030,16 @@ MTL::CommandBuffer * MetalOps::call_build_mask_simple(MTL::CommandBuffer *comman
 #endif
 
 #ifdef METAL_DO_WAITS
-     command->commit();
-     command->waitUntilCompleted();
-     assert(command->status() == MTL::CommandBufferStatusCompleted);
-     command->retain();
-     command->release();
-
-     command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
 
-    return command;
 }
 
-MTL::CommandBuffer * MetalOps::call_trimmed_to_next_buckets_st2(MTL::CommandBuffer *command, MetalContext &context,
+void MetalOps::call_trimmed_to_next_buckets_st2(MetalEncoderManager & encMrg, MetalContext &context,
             uint bucket_idx,
             std::string & prev_event)
 {
-    MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_trimmed_to_next_buckets_st2.pipeline);
 
     uint32_t buf_idx = 0;
@@ -1074,16 +1064,6 @@ MTL::CommandBuffer * MetalOps::call_trimmed_to_next_buckets_st2(MTL::CommandBuff
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size(BUCKETS_NUM * TRIM_ST2_TREADS_NUM, 1, 1),
                                  MTL::Size(TRIM_ST2_TREADS_NUM, 1, 1)); // 8192 tasks
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
-
-/*#ifndef NDEBUG
-    MTL::BlitCommandEncoder* blit = command->blitCommandEncoder();
-    blit->synchronizeResource(context.primary_data_private);
-    blit->endEncoding();
-#endif
-*/
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
         command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer *buffer) {
@@ -1096,24 +1076,16 @@ MTL::CommandBuffer * MetalOps::call_trimmed_to_next_buckets_st2(MTL::CommandBuff
 #endif
 
 #ifdef METAL_DO_WAITS
-     command->commit();
-     command->waitUntilCompleted();
-     assert(command->status() == MTL::CommandBufferStatusCompleted);
-     command->retain();
-     command->release();
-
-     command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
-
-    return command;
 }
 
-MTL::CommandBuffer * MetalOps::call_compact_zeroes(MTL::CommandBuffer *command, MetalContext &context,
+void MetalOps::call_compact_zeroes(MetalEncoderManager & encMrg, MetalContext &context,
                 uint bucket_idx,
                 std::string & prev_event,
                 uint32_t trim_param_offset) {
 
-    MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_compact_zeroes.pipeline);
 
     uint32_t buf_idx = 0;
@@ -1128,9 +1100,6 @@ MTL::CommandBuffer * MetalOps::call_compact_zeroes(MTL::CommandBuffer *command, 
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size(BUCKETS_NUM * COMPACT_TREADS_NUM, 1, 1),
                                  MTL::Size(COMPACT_TREADS_NUM, 1, 1)); // 8192 tasks
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
         command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer *buffer) {
@@ -1143,24 +1112,16 @@ MTL::CommandBuffer * MetalOps::call_compact_zeroes(MTL::CommandBuffer *command, 
 #endif
 
 #ifdef METAL_DO_WAITS
-     command->commit();
-     command->waitUntilCompleted();
-     assert(command->status() == MTL::CommandBufferStatusCompleted);
-     command->retain();
-     command->release();
-
-     command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
-
-    return command;
 }
 
-MTL::CommandBuffer * MetalOps::call_apply_collapsed_data(MTL::CommandBuffer *command, MetalContext &context,
+void MetalOps::call_apply_collapsed_data(MetalEncoderManager & encMrg, MetalContext &context,
                 bool isStep2,
                 int mask_scale_k,
                 bool passU, uint bucket_idx,
                 std::string & prev_event) {
-    MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_apply_collapsed_data.pipeline);
 
     uint32_t buf_idx = 0;
@@ -1185,9 +1146,6 @@ MTL::CommandBuffer * MetalOps::call_apply_collapsed_data(MTL::CommandBuffer *com
 
     int collapse_tasks_num = (context.get_mask_size()/3/8 + mask_scale_k-1) / mask_scale_k;
     encoder->dispatchThreads(MTL::Size(collapse_tasks_num, 1, 1), MTL::Size(1, 1, 1));
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
     command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer *buffer) {
@@ -1200,23 +1158,15 @@ MTL::CommandBuffer * MetalOps::call_apply_collapsed_data(MTL::CommandBuffer *com
 #endif
 
 #ifdef METAL_DO_WAITS
-    command->commit();
-    command->waitUntilCompleted();
-    assert(command->status() == MTL::CommandBufferStatusCompleted);
-    command->retain();
-    command->release();
-
-    command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
-
-    return command;
 }
 
-MTL::CommandBuffer * MetalOps::call_build_mask(MTL::CommandBuffer *command, MetalContext &context,
+void MetalOps::call_build_mask(MetalEncoderManager & encMrg, MetalContext &context,
                     bool passU, uint32_t bucket_idx,
                     std::string & prev_event) {
     // next building the mask
-    MTL::ComputeCommandEncoder* encoder = encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_build_mask.pipeline);
 
     int buf_idx = 0;
@@ -1231,12 +1181,9 @@ MTL::CommandBuffer * MetalOps::call_build_mask(MTL::CommandBuffer *command, Meta
 
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size(BUCKETS_NUM * BUILD_MASK_THREADS_NUM, 1, 1), MTL::Size(BUILD_MASK_THREADS_NUM, 1, 1));
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
 
     // trim_mask
-    encoder = command->computeCommandEncoder();
+    encoder = encMrg.get_encoder();
     encoder->setComputePipelineState(f_trim_mask.pipeline);
 
     assert(context.get_mask_size()%3 == 0);
@@ -1249,9 +1196,6 @@ MTL::CommandBuffer * MetalOps::call_build_mask(MTL::CommandBuffer *command, Meta
 
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size(tasks, 1, 1), MTL::Size(1, 1, 1)); // 8192 tasks
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
 
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
@@ -1265,26 +1209,19 @@ MTL::CommandBuffer * MetalOps::call_build_mask(MTL::CommandBuffer *command, Meta
 #endif
 
 #ifdef METAL_DO_WAITS
-    command->commit();
-    command->waitUntilCompleted();
-    assert(command->status() == MTL::CommandBufferStatusCompleted);
-    command->retain();
-    command->release();
-
-    command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
 
-    return command;
 }
 
-MTL::CommandBuffer * MetalOps::call_trimmed_to_next_buckets_st_trim(
-            MTL::CommandBuffer *command,
+void MetalOps::call_trimmed_to_next_buckets_st_trim(
+            MetalEncoderManager & encMrg,
             MetalContext &context,
             bool passU, uint32_t bucket_idx,
             std::string & prev_event)
 {
     // And now we can process to the next bucket
-    MTL::ComputeCommandEncoder* encoder = command->computeCommandEncoder();
+    MTL::ComputeCommandEncoder* encoder = encMrg.get_encoder();
     encoder->setComputePipelineState( f_trimmed_to_next_buckets_st_trim.pipeline);
 
     uint32_t buf_idx = 0;
@@ -1310,10 +1247,6 @@ MTL::CommandBuffer * MetalOps::call_trimmed_to_next_buckets_st_trim(
 
     // Dispatch threads for each buffer (assuming 1 result per buffer)
     encoder->dispatchThreads(MTL::Size( BUCKETS_NUM * TRIM_THREADS_NUM, 1, 1), MTL::Size(TRIM_THREADS_NUM, 1, 1));
-    encoder->endEncoding();
-    encoder->retain();
-    encoder->release();
-
 
 #if defined(METAL_DO_WAITS) && defined(METALL_CALLBACKS_PERF)
     command->addCompletedHandler([=, &prev_event](MTL::CommandBuffer *buffer) {
@@ -1326,16 +1259,8 @@ MTL::CommandBuffer * MetalOps::call_trimmed_to_next_buckets_st_trim(
 #endif
 
 #ifdef METAL_DO_WAITS
-    command->commit();
-    command->waitUntilCompleted();
-    assert(command->status() == MTL::CommandBufferStatusCompleted);
-    command->retain();
-    command->release();
-
-    command = primary_queue->commandBuffer();
+    encMrg.waitUntilCompleted();
 #endif
-
-    return command;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1651,7 +1576,7 @@ void MetalOps::test_trim_collapdes_results(MetalContext &context,
 
 
 
-void MetalOps::init_st1_build_buckets_params(MetalContext &context,
+void MetalOps::init_st1_build_buckets_params(MetalEncoderManager & encMrg, MetalContext &context,
                     const uint64_t hash_keys[4],
                     Step1Params* params,
                     std::vector<MemRange> & st1_8B_buckets,
@@ -1678,12 +1603,12 @@ void MetalOps::init_st1_build_buckets_params(MetalContext &context,
 
     params->bucket_size = bucket_alloc_edges;
     for (uint k=0; k<BUCKETS_8B_NUM; k++) {
-        st1_8B_buckets.push_back( context.get_mem_pool()->allocate(bucket_alloc_edges*8) );
+        st1_8B_buckets.push_back( context.get_mem_pool()->allocate(bucket_alloc_edges*8, encMrg) );
         const MemRange & mr = st1_8B_buckets.back();
         params->bucket_blocks[k] = mr.to_allocated_block();
     }
     for (uint k=BUCKETS_8B_NUM; k<BUCKETS_NUM; k++) {
-        st1_1B_buckets.push_back( context.get_mem_pool()->allocate(bucket_alloc_edges*4) );
+        st1_1B_buckets.push_back( context.get_mem_pool()->allocate(bucket_alloc_edges*4, encMrg) );
         const MemRange & mr = st1_1B_buckets.back();
         params->bucket_blocks[k] = mr.to_allocated_block();
     }
@@ -1708,7 +1633,7 @@ static void split_into_chunks(const MemRange & in_bucket,
     }
 }
 
-std::vector<MemRange> MetalOps::init_build_mask_and_buckets_st2(MetalContext &context,
+std::vector<MemRange> MetalOps::init_build_mask_and_buckets_st2(MetalEncoderManager & encMrg, MetalContext &context,
             const uint64_t hash_keys[4],
             Step2Params* params,
             uint32_t bucket_idx,
@@ -1743,7 +1668,7 @@ std::vector<MemRange> MetalOps::init_build_mask_and_buckets_st2(MetalContext &co
 
     res_buckets.resize(BUCKETS_NUM);
     for (uint k=0; k<BUCKETS_NUM; k++) {
-        res_buckets[k] = context.get_mem_pool()->allocate(bucket_size);
+        res_buckets[k] = context.get_mem_pool()->allocate(bucket_size, encMrg);
         params->out_blocks[k] = res_buckets[k].to_allocated_block();
     }
     params->out_block_size = bucket_size / 8;

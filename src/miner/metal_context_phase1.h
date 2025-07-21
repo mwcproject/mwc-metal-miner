@@ -24,10 +24,6 @@ class MetalContextPhase1 : public MetalContext {
 private:
     MemPool mem_pool;
 
-    // Sync event
-    MTL::SharedEvent* event = nullptr;
-    int event_counter = 0;
-
     // Primary memory buffers
     MTL::Buffer* buffer0 = nullptr;
     MTL::Buffer* buffer1 = nullptr;
@@ -71,9 +67,6 @@ public:
     void init_phase1(const MetalOps & metal);
     void reset_phase1(const MetalOps & metal);
     void release();
-
-    virtual MTL::SharedEvent* get_event() override;
-    virtual int generate_next_event() override;
 
     virtual MemPool * get_mem_pool() override;
     virtual MTL::Buffer* get_buffer0() override;

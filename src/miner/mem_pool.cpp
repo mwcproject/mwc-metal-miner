@@ -16,6 +16,7 @@
 
 #include <iostream>
 #include <ostream>
+#include "metal.h"
 
 std::string MemRange::to_string() const {
     return  "Range(" + std::to_string(buffer) + "," + std::to_string(start) + ", " + std::to_string(end) + ")";
@@ -53,12 +54,12 @@ void MemPool::reset(int buffers, uint64_t total_pool_size_bytes) {
 }
 
 
-MemRange MemPool::allocate(uint64_t length_byte) {
+MemRange MemPool::allocate(uint64_t length_byte, MetalEncoderManager & enc_man) {
     std::lock_guard<std::mutex> lock(mtx);
-    return allocate_impl(length_byte);
+    return allocate_impl(length_byte, false, enc_man);
 }
 
-MemRange MemPool::allocate_impl(uint64_t length_byte, bool wait_for_completion) {
+MemRange MemPool::allocate_impl(uint64_t length_byte, bool wait_for_completion, MetalEncoderManager & enc_man) {
     int mem_len = (length_byte + MEM_POOL_UNITS - 1) / MEM_POOL_UNITS;
 
     // allocating from the first available unit
@@ -101,6 +102,14 @@ MemRange MemPool::allocate_impl(uint64_t length_byte, bool wait_for_completion) 
     }
 
     std::vector<MemRange> new_ranges;
+
+    if (wait_for_completion) {
+        MTL::CommandBuffer * cmd_buf = enc_man.take_command_buffer();
+        if (cmd_buf) {
+            // no reason to keep it here
+            enc_man.stash_buf(cmd_buf);
+        }
+    }
 
     for (std::pair<MemRange, MTL::CommandBuffer *> & deal : deallocated) {
 #ifndef METAL_DO_WAITS
@@ -151,7 +160,7 @@ MemRange MemPool::allocate_impl(uint64_t length_byte, bool wait_for_completion) 
         return a.length() < b.length();
     } );
 
-    return allocate_impl(length_byte, true);
+    return allocate_impl(length_byte, true, enc_man);
 }
 
 void MemPool::release(const MemRange & range, MetalContext & context, MTL::CommandBuffer *command) {

@@ -24,6 +24,8 @@
 // Memory manage operate by pages. Allocated blocks are expected to be large
 #define MEM_POOL_UNITS 4096
 
+struct MetalEncoderManager;
+
 // Memory pool based on buffers. We need to manage memory somehow.
 struct MemRange {
     uint32_t buffer; // index of the buffer (0 or 1)
@@ -93,7 +95,7 @@ public:
     void reset(int buffers, uint64_t total_pool_size_bytes);
 
     // Allocate a new memroy block. Will crash in case of not enough memory.
-    MemRange allocate(uint64_t length_byte);
+    MemRange allocate(uint64_t length_byte, MetalEncoderManager & enc_man);
 
     // Release block
     void release(const MemRange & range, MetalContext & context, MTL::CommandBuffer *command);
@@ -105,7 +107,7 @@ public:
     // Status of available blocks. For debug only
     std::string getMemoryStatus() const;
 private:
-    MemRange allocate_impl(uint64_t length_byte, bool wait_for_completion = false);
+    MemRange allocate_impl(uint64_t length_byte, bool wait_for_completion, MetalEncoderManager & enc_man);
 };
 
 

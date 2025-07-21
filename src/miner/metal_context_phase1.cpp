@@ -21,11 +21,9 @@ void MetalContextPhase1::init_phase1(const MetalOps & metal) {
     BUCKETS_NUM = metal.BUCKETS_NUM;
     MEM_SIZE = metal.MEM_SIZE;
 
-    event = metal.device->newSharedEvent();
-
     assert(metal.MEM_SIZE%2==0);
-    buffer0 = metal.device->newBuffer(MEM_SIZE/2, RES_TYPE);
-    buffer1 = metal.device->newBuffer(MEM_SIZE/2, RES_TYPE);
+    buffer0 = metal.device->newBuffer(MEM_SIZE/2, RES_TYPE | RES_UNTRACKED);
+    buffer1 = metal.device->newBuffer(MEM_SIZE/2, RES_TYPE | RES_UNTRACKED);
 #ifndef NDEBUG
     memset( buffer0->contents(), 0x63, buffer0->length() );
     memset( buffer1->contents(), 0x63, buffer1->length() );
@@ -60,7 +58,7 @@ void MetalContextPhase1::init_phase1(const MetalOps & metal) {
     buf_sz = calc_aligned_offset( collapse_edges_counts_offset + collapse_edges_counts_size);
 #endif
 
-    primary_data_private = metal.device->newBuffer(buf_sz, RES_TYPE);
+    primary_data_private = metal.device->newBuffer(buf_sz, RES_TYPE | RES_UNTRACKED);
 #ifndef NDEBUG
     memset(primary_data_private->contents(), 0x69, buf_sz);
 #endif
@@ -91,7 +89,7 @@ void MetalContextPhase1::init_phase1(const MetalOps & metal) {
     trim_params_size = calc_aligned_offset(sizeof(TrimmingParams)); // size per one item. Total BUCKETS_NUM + BUCKETS_NUM*PRIMARY_TRIM_STEPS
 
     uint32_t buf2_sz = trim_params_offset + trim_params_size * BUCKETS_NUM * (2+1); // u/v for all combinations
-    primary_data_shared = metal.device->newBuffer(buf2_sz, MTL::ResourceStorageModeShared);
+    primary_data_shared = metal.device->newBuffer(buf2_sz, MTL::ResourceStorageModeShared | RES_UNTRACKED);
 
 #ifndef NDEBUG
     memset(primary_data_shared->contents(), 0x69, buf2_sz);
@@ -120,7 +118,6 @@ void MetalContextPhase1::release() {
     RELEASE(buffer1);
     RELEASE(primary_data_private);
     RELEASE(primary_data_shared);
-    RELEASE(event);
 }
 
 MemPool * MetalContextPhase1::get_mem_pool()  {return &mem_pool;}
@@ -211,9 +208,3 @@ uint32_t* MetalContextPhase1::get_collapse_stash() {
     return (uint32_t *) collapse_stash->contents();
 }
 
-MTL::SharedEvent* MetalContextPhase1::get_event() {
-    return event;
-}
-int MetalContextPhase1::generate_next_event() {
-    return ++event_counter;
-}

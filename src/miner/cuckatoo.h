@@ -169,23 +169,28 @@ public:
      * @param hash_v - hash that defines solution
      */
     void test_build_all(uint64_t hash_v[4]) {
-        REPORT_EVENT("Start","", "main", "");
+
 #ifdef NDEBUG
         // Need few iteraiton because for the first one metrics is incorrect. Takes time for Metal to init buffers
         for (int i=0;i<10;i++)
 #endif
         {
+            REPORT_RESET;
+            REPORT_EVENT("Start","", "main", "");
+
             CuckatooSolution solution(100, 1, 0, hash_v, -1);
 
             // Calling all 3 stages
             solution.phase1_result = phase1(hash_v);
+
             phase2(solution);
             if (!solution.solutions.empty()) {
                 enrich_cycles(solution);
                 assert(!solution.cycles.empty());
             }
+            REPORT_EVENT("Find_Cycles","Start", "main", "");
+            REPORT_GENERATE
         }
-        REPORT_EVENT("Find_Cycles","Start", "main", "");
     }
 
 };

@@ -8,7 +8,7 @@ void test_st1_build_buckets(
             MetalContext & context,
             uint32_t bucket_allocated_size,
             const std::vector<MemRange> & st1_8B_buckets,
-            const std::vector<MemRange> & st1_1B_buckets,
+            const std::vector<MemRange> & st1_4B_buckets,
             uint EDGE_BITS);
 
 

@@ -100,6 +100,7 @@ set(SOURCES
         src/tests/test_nonce_to_8b.h
         src/tests/test_build_mask.h
         src/tests/test_build_mask.cpp
+        src/tests/data_dump.h
 )
 
 if(BUILD_TARGET STREQUAL "CPU_MINER")

@@ -16,13 +16,14 @@
 #ifndef FEATURES_H
 #define FEATURES_H
 
+// Run metal as untracked and syncronise it manually
+//#define SYNC_METAL_MANUALLY
 
 // metrics make sense for debugging only to detect if data spill over
-//#define USE_METRICS
+#define USE_METRICS
 
 // Normally collapsed needs to be tracked. BUT this feature preventing as from the consistency tracking
 #define TRACK_COLLAPSED
-
 
 // Testing features, METAL_DO_WAITS needs to be defined
 //#define STAGE1_TESTS
@@ -44,7 +45,14 @@
 // If defined, will add complete callback so performance events will be emitted
 //#define METALL_CALLBACKS_PERF
 
+// Enable to dump the buffers on the disk. We can use that after to validate state. It is expected that the data must be consistent and can be compared.
+//#define WRITE_DUMP
+#define DUMP_DATA_DIR  "/Users/mw/miner-dump-data/"
+
 #ifndef METAL_DO_WAITS
+  // dumps are expected to be correct, only with wating we support them
+  #undef WRITE_DUMP
+
   // no debugging with no wait
   #undef STAGE1_TESTS
   #undef STAGE2_TESTS

@@ -28,9 +28,6 @@ class MetalContext {
 public:
     virtual ~MetalContext() {}
 
-    virtual MTL::SharedEvent* get_event() = 0;
-    virtual int generate_next_event() = 0;
-
     virtual MemPool * get_mem_pool() = 0;
     virtual MTL::Buffer* get_buffer0() = 0;
     virtual MTL::Buffer* get_buffer1() = 0;
